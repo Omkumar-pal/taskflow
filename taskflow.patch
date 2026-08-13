@@ -1,0 +1,548 @@
+diff -ruN '--exclude=node_modules' '--exclude=dist' '--exclude=*.db' taskflow_original/taskflow/backend/schema.sql taskflow_review/taskflow/backend/schema.sql
+--- taskflow_original/taskflow/backend/schema.sql	2026-08-13 10:03:02.000000000 +0000
++++ taskflow_review/taskflow/backend/schema.sql	2026-08-13 12:57:13.322904313 +0000
+@@ -14,6 +14,10 @@
+   position INTEGER NOT NULL
+ );
+ 
++-- Prevents two columns with the same name on the same board.
++CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_column_name_per_board
++ON columns(board_id, name);
++
+ CREATE TABLE IF NOT EXISTS tasks (
+   id          INTEGER PRIMARY KEY AUTOINCREMENT,
+   column_id   INTEGER NOT NULL REFERENCES columns(id) ON DELETE CASCADE,
+diff -ruN '--exclude=node_modules' '--exclude=dist' '--exclude=*.db' taskflow_original/taskflow/backend/server.js taskflow_review/taskflow/backend/server.js
+--- taskflow_original/taskflow/backend/server.js	2026-08-13 11:43:01.000000000 +0000
++++ taskflow_review/taskflow/backend/server.js	2026-08-13 20:40:39.813597205 +0000
+@@ -27,8 +27,15 @@
+   if (!board_id) {
+     return res.status(400).json({ error: 'board_id is required' });
+   }
+-  const column = queries.createColumn(board_id, name.trim());
+-  res.status(201).json(column);
++  try {
++    const column = queries.createColumn(board_id, name.trim());
++    res.status(201).json(column);
++  } catch (err) {
++    if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
++      return res.status(400).json({ error: 'a column with this name already exists on this board' });
++    }
++    throw err;
++  }
+ });
+ 
+ app.get('/boards/:id', (req, res) => {
+@@ -64,7 +71,13 @@
+     const task = queries.createTask({ column_id, title: title.trim(), description, priority });
+     res.status(201).json(task);
+   } catch (err) {
+-    res.status(500).json({ error: 'failed to create task' });
++    if (err.code === 'SQLITE_CONSTRAINT_FOREIGNKEY') {
++      return res.status(400).json({ error: 'column_id does not exist' });
++    }
++    if (err.code === 'SQLITE_CONSTRAINT_CHECK') {
++      return res.status(400).json({ error: 'priority must be Low, Medium, or High' });
++    }
++    throw err;
+   }
+ });
+ 
+@@ -73,17 +86,31 @@
+   if (title !== undefined && !title.trim()) {
+     return res.status(400).json({ error: 'title cannot be empty' });
+   }
+-  const task = queries.updateTask(Number(req.params.id), { title, description, priority });
+-  if (!task) return res.status(404).json({ error: 'task not found' });
+-  res.json(task);
++  try {
++    const task = queries.updateTask(Number(req.params.id), { title, description, priority });
++    if (!task) return res.status(404).json({ error: 'task not found' });
++    res.json(task);
++  } catch (err) {
++    if (err.code === 'SQLITE_CONSTRAINT_CHECK') {
++      return res.status(400).json({ error: 'priority must be Low, Medium, or High' });
++    }
++    throw err;
++  }
+ });
+ 
+ app.patch('/tasks/:id/move', (req, res) => {
+   const { column_id } = req.body;
+   if (!column_id) return res.status(400).json({ error: 'column_id is required' });
+-  const task = queries.moveTask(Number(req.params.id), column_id);
+-  if (!task) return res.status(404).json({ error: 'task not found' });
+-  res.json(task);
++  try {
++    const task = queries.moveTask(Number(req.params.id), column_id);
++    if (!task) return res.status(404).json({ error: 'task not found' });
++    res.json(task);
++  } catch (err) {
++    if (err.code === 'SQLITE_CONSTRAINT_FOREIGNKEY') {
++      return res.status(400).json({ error: 'target column does not exist' });
++    }
++    throw err;
++  }
+ });
+ 
+ app.delete('/tasks/:id', (req, res) => {
+diff -ruN '--exclude=node_modules' '--exclude=dist' '--exclude=*.db' taskflow_original/taskflow/backend/tests/tasks.test.js taskflow_review/taskflow/backend/tests/tasks.test.js
+--- taskflow_original/taskflow/backend/tests/tasks.test.js	2026-08-13 11:43:10.000000000 +0000
++++ taskflow_review/taskflow/backend/tests/tasks.test.js	2026-08-13 20:41:05.863775356 +0000
+@@ -25,6 +25,20 @@
+     expect(res.body.title).toBe('New task');
+     expect(res.body.column_id).toBe(1);
+   });
++
++  it('rejects a column_id that does not exist, instead of a generic 500', async () => {
++    const res = await request(app).post('/tasks').send({ column_id: 9999, title: 'Orphan task' });
++    expect(res.status).toBe(400);
++    expect(res.body.error).toMatch(/column_id/i);
++  });
++
++  it('rejects a priority outside Low/Medium/High, instead of a generic 500', async () => {
++    const res = await request(app)
++      .post('/tasks')
++      .send({ column_id: 1, title: 'Bad priority task', priority: 'Urgent' });
++    expect(res.status).toBe(400);
++    expect(res.body.error).toMatch(/priority/i);
++  });
+ });
+ 
+ describe('PATCH /tasks/:id/move', () => {
+@@ -34,6 +48,29 @@
+     expect(res.status).toBe(200);
+     expect(res.body.column_id).toBe(2);
+   });
++
++  it('rejects a move to a column_id that does not exist, instead of a generic 500', async () => {
++    const created = await request(app).post('/tasks').send({ column_id: 1, title: 'Move me' });
++    const res = await request(app).patch(`/tasks/${created.body.id}/move`).send({ column_id: 9999 });
++    expect(res.status).toBe(400);
++    expect(res.body.error).toMatch(/column/i);
++  });
++});
++
++describe('PATCH /tasks/:id', () => {
++  it('rejects a priority outside Low/Medium/High, instead of a generic 500', async () => {
++    const created = await request(app).post('/tasks').send({ column_id: 1, title: 'Reprioritize me' });
++    const res = await request(app).patch(`/tasks/${created.body.id}`).send({ priority: 'Urgent' });
++    expect(res.status).toBe(400);
++    expect(res.body.error).toMatch(/priority/i);
++  });
++
++  it('updates priority when given a valid value', async () => {
++    const created = await request(app).post('/tasks').send({ column_id: 1, title: 'Reprioritize me' });
++    const res = await request(app).patch(`/tasks/${created.body.id}`).send({ priority: 'High' });
++    expect(res.status).toBe(200);
++    expect(res.body.priority).toBe('High');
++  });
+ });
+ 
+ describe('DB layer: getTasksByPriority (hits the database directly)', () => {
+@@ -87,6 +124,18 @@
+     const res = await request(app).post('/columns').send({ board_id: 1, name: '' });
+     expect(res.status).toBe(400);
+   });
++
++  it('rejects a duplicate column name on the same board, instead of a generic 500', async () => {
++    const res = await request(app).post('/columns').send({ board_id: 1, name: 'To Do' });
++    expect(res.status).toBe(400);
++    expect(res.body.error).toMatch(/already exists/i);
++  });
++
++  it('allows the same column name on a different board', async () => {
++    const otherBoard = await request(app).post('/boards').send({ name: 'Other Board' });
++    const res = await request(app).post('/columns').send({ board_id: otherBoard.body.id, name: 'To Do' });
++    expect(res.status).toBe(201);
++  });
+ });
+ 
+ describe('DB layer: getTaskCountsPerColumn', () => {
+diff -ruN '--exclude=node_modules' '--exclude=dist' '--exclude=*.db' taskflow_original/taskflow/frontend/src/App.jsx taskflow_review/taskflow/frontend/src/App.jsx
+--- taskflow_original/taskflow/frontend/src/App.jsx	2026-08-13 11:43:54.000000000 +0000
++++ taskflow_review/taskflow/frontend/src/App.jsx	2026-08-13 21:32:31.089509501 +0000
+@@ -44,58 +44,42 @@
+     if (boardId) loadBoard(boardId);
+   }, [boardId]);
+ 
++  // These six intentionally do NOT catch: a failure here is a form-level
++  // validation problem (duplicate name, bad priority, etc.), not an app-level
++  // failure. Letting it throw means the component that called it — the form,
++  // the card — can show the message inline and let the user try again,
++  // instead of the whole board getting replaced by the global error banner.
++  // loadBoards/loadBoard above are different: those really are "the app
++  // couldn't load," so they keep their own catch -> setError.
++
+   async function handleCreateBoard(name) {
+-    try {
+-      const newBoard = await api.createBoard(name);
+-      await loadBoards(newBoard.id);
+-    } catch (err) {
+-      setError(err.message);
+-    }
++    const newBoard = await api.createBoard(name);
++    await loadBoards(newBoard.id);
+   }
+ 
+   async function handleCreateColumn(name) {
+-    try {
+-      await api.createColumn(boardId, name);
+-      loadBoard(boardId);
+-    } catch (err) {
+-      setError(err.message);
+-    }
++    await api.createColumn(boardId, name);
++    await loadBoard(boardId);
+   }
+ 
+   async function handleCreateTask(columnId, values) {
+-    try {
+-      await api.createTask({ column_id: columnId, ...values });
+-      loadBoard(boardId);
+-    } catch (err) {
+-      setError(err.message);
+-    }
++    await api.createTask({ column_id: columnId, ...values });
++    await loadBoard(boardId);
+   }
+ 
+   async function handleMoveTask(taskId, newColumnId) {
+-    try {
+-      await api.moveTask(taskId, newColumnId);
+-      loadBoard(boardId);
+-    } catch (err) {
+-      setError(err.message);
+-    }
++    await api.moveTask(taskId, newColumnId);
++    await loadBoard(boardId);
+   }
+ 
+   async function handleDeleteTask(taskId) {
+-    try {
+-      await api.deleteTask(taskId);
+-      loadBoard(boardId);
+-    } catch (err) {
+-      setError(err.message);
+-    }
++    await api.deleteTask(taskId);
++    await loadBoard(boardId);
+   }
+ 
+   async function handleUpdateTask(taskId, updates) {
+-    try {
+-      await api.updateTask(taskId, updates);
+-      loadBoard(boardId);
+-    } catch (err) {
+-      setError(err.message);
+-    }
++    await api.updateTask(taskId, updates);
++    await loadBoard(boardId);
+   }
+ 
+   if (error) {
+@@ -122,7 +106,11 @@
+           />
+           <label>
+             Filter by priority:{' '}
+-            <select value={priorityFilter} onChange={(e) => setPriorityFilter(e.target.value)}>
++            <select
++              className="priority-filter"
++              value={priorityFilter}
++              onChange={(e) => setPriorityFilter(e.target.value)}
++            >
+               <option>All</option>
+               <option>Low</option>
+               <option>Medium</option>
+diff -ruN '--exclude=node_modules' '--exclude=dist' '--exclude=*.db' taskflow_original/taskflow/frontend/src/components/AddColumnForm.jsx taskflow_review/taskflow/frontend/src/components/AddColumnForm.jsx
+--- taskflow_original/taskflow/frontend/src/components/AddColumnForm.jsx	2026-08-13 11:43:31.000000000 +0000
++++ taskflow_review/taskflow/frontend/src/components/AddColumnForm.jsx	2026-08-13 20:41:46.561426061 +0000
+@@ -3,13 +3,23 @@
+ export default function AddColumnForm({ onCreate }) {
+   const [adding, setAdding] = useState(false);
+   const [name, setName] = useState('');
++  const [formError, setFormError] = useState(null);
++  const [submitting, setSubmitting] = useState(false);
+ 
+-  function handleSubmit(e) {
++  async function handleSubmit(e) {
+     e.preventDefault();
+     if (!name.trim()) return;
+-    onCreate(name.trim());
+-    setName('');
+-    setAdding(false);
++    setFormError(null);
++    setSubmitting(true);
++    try {
++      await onCreate(name.trim());
++      setName('');
++      setAdding(false);
++    } catch (err) {
++      setFormError(err.message);
++    } finally {
++      setSubmitting(false);
++    }
+   }
+ 
+   if (!adding) {
+@@ -22,6 +32,7 @@
+ 
+   return (
+     <form onSubmit={handleSubmit} className="add-column-form">
++      {formError && <p className="form-error">{formError}</p>}
+       <input
+         autoFocus
+         placeholder="Column name"
+@@ -29,8 +40,8 @@
+         onChange={(e) => setName(e.target.value)}
+       />
+       <div className="form-actions">
+-        <button type="submit">Add</button>
+-        <button type="button" onClick={() => setAdding(false)}>
++        <button type="submit" disabled={submitting}>Add</button>
++        <button type="button" onClick={() => { setAdding(false); setFormError(null); }}>
+           Cancel
+         </button>
+       </div>
+diff -ruN '--exclude=node_modules' '--exclude=dist' '--exclude=*.db' taskflow_original/taskflow/frontend/src/components/BoardSelector.jsx taskflow_review/taskflow/frontend/src/components/BoardSelector.jsx
+--- taskflow_original/taskflow/frontend/src/components/BoardSelector.jsx	2026-08-13 11:43:26.000000000 +0000
++++ taskflow_review/taskflow/frontend/src/components/BoardSelector.jsx	2026-08-13 21:32:35.692545924 +0000
+@@ -3,6 +3,8 @@
+ export default function BoardSelector({ boards, currentBoardId, onSelect, onCreate }) {
+   const [creating, setCreating] = useState(false);
+   const [name, setName] = useState('');
++  const [formError, setFormError] = useState(null);
++  const [submitting, setSubmitting] = useState(false);
+ 
+   function handleChange(e) {
+     if (e.target.value === '__new__') {
+@@ -12,27 +14,38 @@
+     onSelect(Number(e.target.value));
+   }
+ 
+-  function handleCreate(e) {
++  async function handleCreate(e) {
+     e.preventDefault();
+     if (!name.trim()) return;
+-    onCreate(name.trim());
+-    setName('');
+-    setCreating(false);
++    setFormError(null);
++    setSubmitting(true);
++    try {
++      await onCreate(name.trim());
++      setName('');
++      setCreating(false);
++    } catch (err) {
++      setFormError(err.message);
++    } finally {
++      setSubmitting(false);
++    }
+   }
+ 
+   if (creating) {
+     return (
+       <form onSubmit={handleCreate} className="board-create-form">
++        {formError && <p className="form-error">{formError}</p>}
+         <input
+           autoFocus
+           placeholder="New board name"
+           value={name}
+           onChange={(e) => setName(e.target.value)}
+         />
+-        <button type="submit">Create</button>
+-        <button type="button" onClick={() => setCreating(false)}>
+-          Cancel
+-        </button>
++        <div className="form-actions">
++          <button type="submit" disabled={submitting}>Create</button>
++          <button type="button" onClick={() => { setCreating(false); setFormError(null); }}>
++            Cancel
++          </button>
++        </div>
+       </form>
+     );
+   }
+diff -ruN '--exclude=node_modules' '--exclude=dist' '--exclude=*.db' taskflow_original/taskflow/frontend/src/components/Column.jsx taskflow_review/taskflow/frontend/src/components/Column.jsx
+--- taskflow_original/taskflow/frontend/src/components/Column.jsx	2026-08-13 10:09:58.000000000 +0000
++++ taskflow_review/taskflow/frontend/src/components/Column.jsx	2026-08-13 20:42:02.763811835 +0000
+@@ -34,8 +34,8 @@
+       ))}
+       {showForm ? (
+         <TaskForm
+-          onSubmit={(values) => {
+-            onCreateTask(column.id, values);
++          onSubmit={async (values) => {
++            await onCreateTask(column.id, values);
+             setShowForm(false);
+           }}
+           onCancel={() => setShowForm(false)}
+diff -ruN '--exclude=node_modules' '--exclude=dist' '--exclude=*.db' taskflow_original/taskflow/frontend/src/components/TaskCard.jsx taskflow_review/taskflow/frontend/src/components/TaskCard.jsx
+--- taskflow_original/taskflow/frontend/src/components/TaskCard.jsx	2026-08-13 10:09:58.000000000 +0000
++++ taskflow_review/taskflow/frontend/src/components/TaskCard.jsx	2026-08-13 20:42:19.735036309 +0000
+@@ -5,16 +5,45 @@
+   const [title, setTitle] = useState(task.title);
+   const [description, setDescription] = useState(task.description || '');
+   const [priority, setPriority] = useState(task.priority);
++  const [cardError, setCardError] = useState(null);
++  const [busy, setBusy] = useState(false);
+ 
+-  function save() {
++  async function save() {
+     if (!title.trim()) return;
+-    onUpdate({ title: title.trim(), description, priority });
+-    setEditing(false);
++    setCardError(null);
++    setBusy(true);
++    try {
++      await onUpdate({ title: title.trim(), description, priority });
++      setEditing(false);
++    } catch (err) {
++      setCardError(err.message);
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  async function handleMove(newColumnId) {
++    setCardError(null);
++    try {
++      await onMove(newColumnId);
++    } catch (err) {
++      setCardError(err.message);
++    }
++  }
++
++  async function handleDelete() {
++    setCardError(null);
++    try {
++      await onDelete();
++    } catch (err) {
++      setCardError(err.message);
++    }
+   }
+ 
+   if (editing) {
+     return (
+       <div className="task-card editing">
++        {cardError && <p className="form-error">{cardError}</p>}
+         <input value={title} onChange={(e) => setTitle(e.target.value)} />
+         <textarea value={description} onChange={(e) => setDescription(e.target.value)} />
+         <select value={priority} onChange={(e) => setPriority(e.target.value)}>
+@@ -23,8 +52,8 @@
+           <option>High</option>
+         </select>
+         <div className="form-actions">
+-          <button onClick={save}>Save</button>
+-          <button onClick={() => setEditing(false)}>Cancel</button>
++          <button onClick={save} disabled={busy}>Save</button>
++          <button onClick={() => { setEditing(false); setCardError(null); }}>Cancel</button>
+         </div>
+       </div>
+     );
+@@ -32,12 +61,13 @@
+ 
+   return (
+     <div className="task-card">
++      {cardError && <p className="form-error">{cardError}</p>}
+       <div className="task-card-top">
+         <strong>{task.title}</strong>
+         <span className={`priority priority-${task.priority.toLowerCase()}`}>{task.priority}</span>
+       </div>
+       {task.description && <p>{task.description}</p>}
+-      <select value={task.column_id} onChange={(e) => onMove(Number(e.target.value))}>
++      <select value={task.column_id} onChange={(e) => handleMove(Number(e.target.value))}>
+         {allColumns.map((c) => (
+           <option key={c.id} value={c.id}>
+             {c.name}
+@@ -46,7 +76,7 @@
+       </select>
+       <div className="form-actions">
+         <button onClick={() => setEditing(true)}>Edit</button>
+-        <button onClick={onDelete}>Delete</button>
++        <button onClick={handleDelete}>Delete</button>
+       </div>
+     </div>
+   );
+diff -ruN '--exclude=node_modules' '--exclude=dist' '--exclude=*.db' taskflow_original/taskflow/frontend/src/components/TaskForm.jsx taskflow_review/taskflow/frontend/src/components/TaskForm.jsx
+--- taskflow_original/taskflow/frontend/src/components/TaskForm.jsx	2026-08-13 10:09:58.000000000 +0000
++++ taskflow_review/taskflow/frontend/src/components/TaskForm.jsx	2026-08-13 20:41:55.906783112 +0000
+@@ -5,14 +5,23 @@
+   const [description, setDescription] = useState('');
+   const [priority, setPriority] = useState('Medium');
+   const [formError, setFormError] = useState(null);
++  const [submitting, setSubmitting] = useState(false);
+ 
+-  function handleSubmit(e) {
++  async function handleSubmit(e) {
+     e.preventDefault();
+     if (!title.trim()) {
+       setFormError('Title is required');
+       return;
+     }
+-    onSubmit({ title: title.trim(), description, priority });
++    setFormError(null);
++    setSubmitting(true);
++    try {
++      await onSubmit({ title: title.trim(), description, priority });
++    } catch (err) {
++      setFormError(err.message);
++    } finally {
++      setSubmitting(false);
++    }
+   }
+ 
+   return (
+@@ -35,7 +44,7 @@
+         <option>High</option>
+       </select>
+       <div className="form-actions">
+-        <button type="submit">Add</button>
++        <button type="submit" disabled={submitting}>Add</button>
+         <button type="button" onClick={onCancel}>
+           Cancel
+         </button>
+diff -ruN '--exclude=node_modules' '--exclude=dist' '--exclude=*.db' taskflow_original/taskflow/frontend/src/index.css taskflow_review/taskflow/frontend/src/index.css
+--- taskflow_original/taskflow/frontend/src/index.css	2026-08-13 11:44:07.000000000 +0000
++++ taskflow_review/taskflow/frontend/src/index.css	2026-08-13 21:32:52.379442336 +0000
+@@ -9,6 +9,8 @@
+   display: flex;
+   justify-content: space-between;
+   align-items: center;
++  gap: 12px;
++  flex-wrap: wrap;
+   margin-bottom: 20px;
+ }
+ header h1 { font-size: 20px; margin: 0; }
+@@ -51,7 +53,7 @@
+   box-sizing: border-box;
+   padding: 6px;
+ }
+-.form-error { color: #bf2600; font-size: 12px; }
++.form-error { color: #bf2600; font-size: 12px; margin: 0 0 6px; }
+ .add-task-btn {
+   width: 100%;
+   background: none;
+@@ -68,10 +70,19 @@
+   margin: 20px;
+   border-radius: 8px;
+ }
+-.header-controls { display: flex; align-items: center; gap: 16px; }
+-.board-selector { padding: 6px; border-radius: 4px; border: 1px solid #dfe1e6; }
+-.board-create-form { display: flex; gap: 6px; align-items: center; }
++.header-controls { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
++.board-selector,
++.priority-filter {
++  padding: 6px;
++  border-radius: 4px;
++  border: 1px solid #dfe1e6;
++  background: white;
++  font: inherit;
++}
++.board-create-form { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
++.board-create-form .form-error { flex-basis: 100%; margin: 0 0 4px; }
+ .board-create-form input { padding: 6px; border-radius: 4px; border: 1px solid #dfe1e6; }
++.board-create-form .form-actions { margin-top: 0; }
+ .add-column-wrapper { width: 260px; flex-shrink: 0; }
+ .add-column-btn {
+   width: 100%;

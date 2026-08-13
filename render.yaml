@@ -7,5 +7,7 @@ services:
     buildCommand: npm install && npm run seed
     startCommand: npm start
     envVars:
-      - key: FRONTEND_URL
-        sync: false   # set this after the frontend is deployed, e.g. https://taskflow.vercel.app
+      - key: NODE_VERSION
+    value: 20.18.0
+  - key: FRONTEND_URL
+    sync: false
