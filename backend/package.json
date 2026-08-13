@@ -1,0 +1,23 @@
+{
+  "name": "taskflow-backend",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "seed": "node seed.js",
+    "test": "jest --runInBand"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^7.0.0"
+  }
+}

@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: taskflow-backend
+    runtime: node
+    plan: free
+    rootDir: backend
+    buildCommand: npm install && npm run seed
+    startCommand: npm start
+    envVars:
+      - key: FRONTEND_URL
+        sync: false   # set this after the frontend is deployed, e.g. https://taskflow.vercel.app
