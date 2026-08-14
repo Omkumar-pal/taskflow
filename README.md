@@ -177,8 +177,8 @@ For real persistence, the options are: a paid Render instance with an attached p
 
 ## Time spent
 
-[Fill in — roughly X hours]
+6-7 hours exact
 
 ## Something I found interesting
+I know sql and its theory but using it in practical situation give me a broad spectrum of learning around database, Enjoyed building the assignment.
 
-[Fill in — e.g. the LEFT JOIN vs JOIN behavior with empty columns, or the SQLite foreign_keys pragma being off by default]
