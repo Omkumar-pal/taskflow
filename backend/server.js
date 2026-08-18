@@ -10,6 +10,11 @@ const FRONTEND_URL = process.env.FRONTEND_URL;
 app.use(cors(FRONTEND_URL ? { origin: FRONTEND_URL } : {}));
 app.use(express.json());
 
+// Lightweight health check endpoint for keep-alive pingers (e.g. UptimeRobot, cron-job.org)
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 app.get('/boards', (req, res) => {
   res.json(queries.getAllBoards());
 });
